@@ -1,0 +1,8 @@
+{
+  "name": "Remix: Video Scrub",
+  "description": "Bidirectional Shade DSL Translator \u0026 Agent",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
