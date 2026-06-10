@@ -11,6 +11,7 @@ import React, { useRef, useEffect, useState, useMemo } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import * as THREE from "three";
 import Lenis from "lenis";
+import wabt from "wabt";
 
 // --- WEBASSEMBLY PHYSICS INTERPOLATION FOR SMOOTH SCROLL SCRUBBING ---
 interface WasmPhysicsInstance {
@@ -18,56 +19,78 @@ interface WasmPhysicsInstance {
   step_progress: (current: number, velocity: number, dt: number) => number;
 }
 
+// What changed: Handled dynamic WAT assembling and compiling via wabt.js loaded inline.
+// How to undo: Revert to the static Uint8Array bytecode chunk and delete the WAT_SOURCE string.
+const WAT_SOURCE = `
+(module
+  (func $step_velocity (export "step_velocity")
+    (param $target f32) (param $current f32) (param $velocity f32)
+    (param $stiffness f32) (param $damping f32) (param $mass f32) (param $dt f32)
+    (result f32)
+    ;; Newton/Hooke Formula: acceleration = ((target - current) * stiffness - velocity * damping) / mass
+    ;; velocity = velocity + acceleration * dt
+    local.get $velocity
+    local.get $target
+    local.get $current
+    f32.sub
+    local.get $stiffness
+    f32.mul
+    local.get $velocity
+    local.get $damping
+    f32.mul
+    f32.sub
+    local.get $mass
+    f32.div
+    local.get $dt
+    f32.mul
+    f32.add
+  )
+  (func $step_progress (export "step_progress")
+    (param $current f32) (param $velocity f32) (param $dt f32)
+    (result f32)
+    ;; new_progress = current + velocity * dt
+    local.get $current
+    local.get $velocity
+    local.get $dt
+    f32.mul
+    f32.add
+  )
+)
+`;
+
 let wasmPhysicsInstance: WasmPhysicsInstance | null = null;
+let isCompilingWasm = false;
+
+async function compileWasmPhysics() {
+  if (wasmPhysicsInstance || isCompilingWasm) return;
+  isCompilingWasm = true;
+  try {
+    // Dynamically compile our raw Newtonian WAT source into a binary format at runtime
+    const wabtModule = await wabt();
+    const parsed = wabtModule.parseWat("physics.wat", WAT_SOURCE);
+    const { buffer } = parsed.toBinary({});
+    
+    // Compile and instantiate into full native WebAssembly
+    const module = await WebAssembly.compile(buffer);
+    const instance = await WebAssembly.instantiate(module);
+    
+    wasmPhysicsInstance = instance.exports as any;
+    console.log("⚡ [WASM Physics Engine] Dynamic WAT compiled via WABT successfully.");
+    parsed.destroy(); // Always free WABT internal resources to prevent memory leaks
+  } catch (err) {
+    console.error("❌ [WASM Physics Engine] Dynamic WAT compilation failed: ", err);
+  } finally {
+    isCompilingWasm = false;
+  }
+}
+
+// Initiate background compilation on module evaluation
+compileWasmPhysics();
 
 function initWasmPhysics(): WasmPhysicsInstance | null {
   if (wasmPhysicsInstance) return wasmPhysicsInstance;
-  try {
-    // Compiled WASM bytecode containing Newtonian math solvers
-    const bytes = new Uint8Array([
-      0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-      0x01, 0x13, 0x02, 
-      0x60, 0x07, 0x7d, 0x7d, 0x7d, 0x7d, 0x7d, 0x7d, 0x7d, 0x01, 0x7d,
-      0x60, 0x03, 0x7d, 0x7d, 0x7d, 0x01, 0x7d,
-      0x03, 0x03, 0x02, 0x00, 0x01,
-      0x07, 0x21, 0x02,
-      0x0d, 0x73, 0x74, 0x65, 0x70, 0x5f, 0x76, 0x65, 0x6c, 0x6f, 0x63, 0x69, 0x74, 0x79, 0x00, 0x00,
-      0x0d, 0x73, 0x74, 0x65, 0x70, 0x5f, 0x70, 0x72, 0x6f, 0x67, 0x72, 0x65, 0x73, 0x73, 0x00, 0x01,
-      0x0a, 0x26, 0x02,
-      0x19, 0x00,
-      0x20, 0x02,
-      0x20, 0x00,
-      0x20, 0x01,
-      0x93,
-      0x20, 0x03,
-      0x94,
-      0x20, 0x02,
-      0x20, 0x04,
-      0x94,
-      0x93,
-      0x20, 0x05,
-      0x95,
-      0x20, 0x06,
-      0x94,
-      0x92,
-      0x0b,
-      0x0a, 0x00,
-      0x20, 0x00,
-      0x20, 0x01,
-      0x20, 0x02,
-      0x94,
-      0x92,
-      0x0b
-    ]);
-
-    const module = new WebAssembly.Module(bytes);
-    const instance = new WebAssembly.Instance(module);
-    wasmPhysicsInstance = instance.exports as any;
-    console.log("⚡ [WASM Physics Engine] WebAssembly acceleration compiled successfully.");
-  } catch (err) {
-    console.warn("⚠️ [WASM Physics Engine] Failed WASM build, using native JS f32 math.", err);
-    wasmPhysicsInstance = null;
-  }
+  // Trigger compiler if not already running
+  compileWasmPhysics();
   return wasmPhysicsInstance;
 }
 
@@ -1007,6 +1030,12 @@ function ScrubberScreen(props: ScrubberScreenProps) {
         uniform float uScrubVelocity;
         uniform vec2 uCanvasResolution;
         uniform vec2 uTextureResolution;
+        uniform float uTime;
+
+        // Custom pseudorandom noise helper
+        float rand(vec2 co) {
+          return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
+        }
 
         void main() {
           // GPGPU Fluid displacement math
@@ -1045,16 +1074,70 @@ function ScrubberScreen(props: ScrubberScreenProps) {
 
           vec2 flippedUv = vec2(finalDistortedUv.x, 1.0 - finalDistortedUv.y);
 
-          // Sample from BOTH low and high textures with sub-pixel alignment
-          vec3 colLow = texture2D(uTextureLow, flippedUv).rgb;
-          vec3 colHigh = texture2D(uTextureHigh, flippedUv).rgb;
+          // Generate dynamic grain noise (changes with time over coordinates)
+          float grainNoise = rand(flippedUv * (sin(uTime) * 10.0 + 15.0)) - 0.5;
 
-          // Custom hardware cross-fade blending to completely hide skipped/missing preloaded frames
-          vec3 col = mix(colLow, colHigh, uBlendWeight);
+          // Multi-sample blur on fluid trail zones with randomized grain offset
+          vec2 blurOffset = vec2(0.0);
+          if (fluidDye > 0.005) {
+            // Compute blurring vector along velocity direction, scaled by dye concentration
+            blurOffset = normalize(fluidVelocity + 0.0001) * fluidDye * (0.012 + 0.004 * grainNoise);
+          }
 
-          // Blend dyed concentration vector glowing paths
-          vec3 neonGlow = vec3(0.0, 0.72, 1.0) * fluidDye * 0.5;
+          vec2 flippedUvBlur1 = clamp(flippedUv + blurOffset, 0.001, 0.999);
+          vec2 flippedUvBlur2 = clamp(flippedUv - blurOffset, 0.001, 0.999);
+
+          // Sample textures (original, blurred offset 1, blurred offset 2)
+          vec3 colLowMain = texture2D(uTextureLow, flippedUv).rgb;
+          vec3 colHighMain = texture2D(uTextureHigh, flippedUv).rgb;
+          vec3 colMain = mix(colLowMain, colHighMain, uBlendWeight);
+
+          vec3 colLowBlur1 = texture2D(uTextureLow, flippedUvBlur1).rgb;
+          vec3 colHighBlur1 = texture2D(uTextureHigh, flippedUvBlur1).rgb;
+          vec3 colBlur1 = mix(colLowBlur1, colHighBlur1, uBlendWeight);
+
+          vec3 colLowBlur2 = texture2D(uTextureLow, flippedUvBlur2).rgb;
+          vec3 colHighBlur2 = texture2D(uTextureHigh, flippedUvBlur2).rgb;
+          vec3 colBlur2 = mix(colLowBlur2, colHighBlur2, uBlendWeight);
+
+          // Blend main color and blurred colors based on dye intensity
+          vec3 col = mix(colMain, (colBlur1 + colBlur2) * 0.5, clamp(fluidDye * 2.2, 0.0, 0.9));
+
+          // Apply gorgeous soft grain overlay overall, with custom styling
+          col += vec3(grainNoise) * 0.035;
+
+          // Estimate normal gradients of the fluid trail density for diffused white specular
+          float stepOffset = 1.8 / uCanvasResolution.x;
+          float dyeL = texture2D(uFluidDye, vUv + vec2(-stepOffset, 0.0)).r;
+          float dyeR = texture2D(uFluidDye, vUv + vec2(stepOffset, 0.0)).r;
+          float dyeT = texture2D(uFluidDye, vUv + vec2(0.0, -stepOffset)).r;
+          float dyeB = texture2D(uFluidDye, vUv + vec2(0.0, stepOffset)).r;
+
+          // Sobel / central differences slope to construct virtual normals
+          vec3 normal = normalize(vec3((dyeR - dyeL) * 2.2, (dyeB - dyeT) * 2.2, 0.22));
+
+          // Virtual directional light source to reflect specular glare
+          vec3 lightDir = normalize(vec3(-0.35, 0.35, 0.6));
+          vec3 viewDir = vec3(0.0, 0.0, 1.0);
+          vec3 halfDir = normalize(lightDir + viewDir);
+
+          // Specular highlights: Blinn-Phong specular on the fluid's normal surface gradient
+          float ndh = max(0.0, dot(normal, halfDir));
+          float specIntensity = pow(ndh, 12.0) * fluidDye * 1.8;
+
+          // Edge highlight where normal is steep (facing away from viewing direction)
+          float edgeSpec = clamp((1.0 - normal.z) * 1.5, 0.0, 1.0) * fluidDye * 0.9;
+
+          // Consolidating white specular light, adding slight grain to the glare
+          float finalSpecular = (specIntensity * 1.1 + edgeSpec * 0.9) * (0.85 + 0.15 * rand(vUv * uTime));
+          vec3 specularHighlight = vec3(1.0, 1.0, 1.0) * finalSpecular;
+
+          // Blend dyed neon trail path
+          vec3 neonGlow = vec3(0.0, 0.72, 1.0) * fluidDye * 0.35;
           col += neonGlow;
+
+          // Superimpose the white specular gloss map
+          col += specularHighlight;
 
           gl_FragColor = vec4(col, 1.0);
         }
@@ -1070,6 +1153,7 @@ function ScrubberScreen(props: ScrubberScreenProps) {
         uScrubVelocity: { value: 0 },
         uCanvasResolution: { value: new THREE.Vector2(size.width, size.height) },
         uTextureResolution: { value: new THREE.Vector2(1280, 720) },
+        uTime: { value: 0 },
       }
     });
   }, [size.width, size.height, fluidDistortionPower, pinchPower]);
@@ -1096,37 +1180,46 @@ function ScrubberScreen(props: ScrubberScreenProps) {
     // 2. Interpolate Hooke's Spring math in bare-metal WASM (Only for smooth scroll stopping)
     // What changed: Integrated action scroll detection. When the user is actively scrolling, progress is mapped 1:1.
     // The physics solver kicks in solely when scrolling stops to handle smooth, organic decelerations.
-    // Also restored a safe JS math fallback instead of throwing to prevent container crashes on browser limitations.
+    // What changed: Active scrolling now estimates real-time scrolling velocity so that on release
+    // the Newtonian engine inherits a natural kinetic starting phase for an ultra-gentle glide.
     // How to undo: Set `const isScrolling = false;` to force spring integration at all times.
     const isScrolling = lenisRef.current ? lenisRef.current.isScrolling : false;
 
     if (isScrolling) {
+      const prevProgress = currentProgress.current;
       currentProgress.current = targetProgress.current;
-      currentVelocity.current = 0;
+      // Calculate rate of change of progress: dp / dt
+      const targetVelocity = dt > 0 ? (currentProgress.current - prevProgress) / dt : 0;
+      // Low-pass filter to smooth and damp the scrolling action velocity gracefully
+      currentVelocity.current = currentVelocity.current * 0.82 + targetVelocity * 0.18;
     } else {
       // What changed: Removed JavaScript math fallback. Physics simulation is strictly WASM only.
       // How to undo: Reintroduce the Euler integration fallback logic block: `const displacement = targetProgress.current - currentProgress.current;`
-      // What changed: Decreased stiffness from 120 to 36 and adjusted damping to 14.5 to make deceleration over-damped.
-      // This creates an ultra-smooth cinematic glide effect when scrolling stops, with zero vibration or bounce.
+      // What changed: Super gentle stiffness (9.0) and critically/over-damped damping (6.3) selected for a luxurious, ultra-smooth cinematic glide.
       // How to undo: Restore stiffness to 120 and damping to 25.
+      // What changed: Integrated inline compilation of WAT to WebAssembly using wabt.js.
+      // While compilation is processing for the first 1-2 frames, map progress 1:1 to prevent crashing.
+      // How to undo: Revert to Throwing Error if `wasm` is null.
       const wasm = initWasmPhysics();
       if (!wasm) {
-        throw new Error("⚡ [VideoScrubWebGL] WASM Physics engine failed to initialize. Acceleration is required.");
+        currentProgress.current = targetProgress.current;
+        currentVelocity.current = 0;
+      } else {
+        currentVelocity.current = wasm.step_velocity(
+          targetProgress.current,
+          currentProgress.current,
+          currentVelocity.current,
+          9.0, // Super gentle stiffness (lowered from 36)
+          6.3, // Damping tuned slightly above critical threshold (6.0) for zero overshoot or bouncing
+          1.0, // mass
+          dt
+        );
+        currentProgress.current = wasm.step_progress(
+          currentProgress.current,
+          currentVelocity.current,
+          dt
+        );
       }
-      currentVelocity.current = wasm.step_velocity(
-        targetProgress.current,
-        currentProgress.current,
-        currentVelocity.current,
-        36,   // stiffness (lowered from 120 for gentler response)
-        14.5, // damping (tuned for critically/over-damped ultra-smooth glide)
-        1.0,  // mass
-        dt
-      );
-      currentProgress.current = wasm.step_progress(
-        currentProgress.current,
-        currentVelocity.current,
-        dt
-      );
     }
 
     currentProgress.current = Math.max(0.0001, Math.min(0.9999, currentProgress.current));
@@ -1196,6 +1289,7 @@ function ScrubberScreen(props: ScrubberScreenProps) {
     material.uniforms.uFluidVelocity.value = fluidSolver.velocity.read.texture;
     material.uniforms.uFluidDye.value = fluidSolver.dye.read.texture;
     material.uniforms.uScrubVelocity.value = currentVelocity.current;
+    material.uniforms.uTime.value = state.clock.getElapsedTime();
 
     if (onScrub) {
       onScrub(currentProgress.current);

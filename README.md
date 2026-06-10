@@ -81,6 +81,16 @@ We build apps like LEGO. Each piece has a specific size and place!
 
 ## Recent Updates
 
+- **Inline WABT.js WebAssembly Text (WAT) Compiler (2026-06-11)**:
+  - **Summary**: Replaced static, hardcoded pre-compiled bytecode WASM sequences with readable, self-documenting WebAssembly Text format (WAT) compiled dynamically at runtime using the `wabt` (WebAssembly Binary Toolkit) package.
+  - **What changed**: (1) Written native Newtonian WAT source script mapping both `$step_velocity` and `$step_progress` operations, offering full transparency of the low-level physics engine. (2) Integrated the `wabt` module compiler inline to parse and translate `.wat` into `.wasm` binary on module initialization. (3) Installed `wabt` dependency package, updating TypeScript interfaces with robust async fallback guards to keep application mounting 100% crash-proof.
+  - **How to undo**: Revert `VideoScrubWebGL.tsx` WebAssembly initialization and compile methods to load from the static `bytes = new Uint8Array([...])` bytecode array directly.
+
+- **Kinetic-Inertial Scroll Stopping & Cinematic Shader Refinements (2026-06-11)**:
+  - **Summary**: Upgraded the scroll release kinematics and visual aesthetics of the fluid trail compositor to deliver an ultra-premium, tactile-interactive user experience.
+  - **What changed**: (1) Engineered a fluid velocity-tracking algorithm that tracks scroll progress rate during active user swipes, allowing the Newtonian spring solver to inherit the exact momentum/velocity on release. (2) Tuned the Newtonian parameters in bare-metal WebAssembly to operate at critically over-damped thresholds (stiffness = 9.0, damping = 6.3), gliding the video to a halt with cinematic smoothness and zero overshoot or vibration. (3) Written a custom 2D normal-reconstruction shader from the GPGPU fluid density gradients, rendering crisp, diffused white Blinn-Phong specular glares along the fluid trail edges and body. (4) Injected dynamic high-frequency grain noise to generate a beautiful, blurry, and photographic "grany" dispersion texture inside the fluid channels.
+  - **How to undo**: Revert to stiffness `36` and damping `14.5` in `VideoScrubWebGL.tsx` and delete `specularHighlight` and `grainNoise` calculations within the fragment shader.
+
 - **Decoupled Scroll-Stopping Spring Physics (2026-06-10)**:
   - **Summary**: Decoupled the Newtonian physics spring animation from active user drag/scroll gestures. Previously, compounding Hooke's spring math with Lenis's built-in smooth scroll easing introduced a heavy double-smoothing lag.
   - **What changed**: Integrated active scroll sensing via `Lenis` state. Active scrolling tracks the target scroll position exactly 1:1, offering instant tactile response. On scroll release/stop, the accelerated Newtonian physics solver activates exclusively to glide, decelerate, and settle the video frame with high-fidelity dampening. Removed JavaScript mathematical fallbacks entirely, making dampening and settle operations 100% WebAssembly powered.

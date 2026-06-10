@@ -1,5 +1,38 @@
 # Development Notebook - Jelly GPGPU Transition
 
+## 2026-06-11: Inline Dynamic WebAssembly Text (WAT) compilation with Wabt.js
+
+### Issue
+Previously, the WebAssembly physics solver loaded pre-compiled WASM binary as a static bytecode `Uint8Array`. While robust, bytecode binary streams are completely opaque, making auditing, debugging, and modifying Newtonian and mathematical equations inside the codebase impossible to read or edit. 
+
+### Solution
+Overhauled the WebAssembly pipeline to utilize readable, inline WebAssembly Text (WAT) format scripts. Configured automatic, on-the-fly compilation at runtime using the official `wabt` (WebAssembly Binary Toolkit) compiler library. Added dynamic promise-chaining and status locks to compile in the background on load without ever halting or crashing the React component tree render pipeline.
+
+### Implementation
+- Added `wabt` NPM dependency.
+- Formulated native `.wat` script representing Hooke's Newtonian simulation step calculations:
+  - `$step_velocity`: Tracks velocity acceleration rates based on physical `stiffness`, `damping`, `mass`, and frame time differentials `dt`.
+  - `$step_progress`: Increments current timeline positions based on step velocity delta.
+- Programmed background dynamic compiling factory `compileWasmPhysics` called immediately on module load and lazy-mounted inside `initWasmPhysics`.
+- Handled loading frames cleanly: If the first few frames run before the asynchronous `wabt` promise compiles and instantiates, the render pipeline maps progress 1:1 temporarily rather than throwing unhandled startup errors.
+
+## 2026-06-11: Kinetic Momentum Release & Cinematic Fluid Specular Shader
+
+### Issues
+1. Bouncy stopped motion: On scroll release, the WebAssembly physics solver initialized with a velocity of 0, neglecting the finger velocity and creating a static feel.
+2. Flat-looking fluid trail: The hydrodynamic GPGPU fluid trail looked flat and lacked textural grit and organic specular gloss, violating the high-end cinematic art direction.
+
+### Solution
+1. Inherit momentum velocity: Low-pass filter and track scroll progress rate of change during active scrolls to feed real-time velocity on release into the Newtonian solver. Use critically over-damped parameters (stiffness = 9.0, damping = 6.3) inside WebAssembly for luxury deceleration.
+2. Advanced Specular and Grain Shader: Write normal-vector gradient estimation based on the fluid dye concentration, and render a high-fidelity Blinn-Phong diffused white specular reflection. Introduce dynamic coordinate-oriented high-frequency grain noise to generate blurry photographic dispersion on fluid boundaries.
+
+### Implementation
+- Added real-time scroll velocity delta calculus `(currentProgress - prevProgress) / dt` in `useFrame` when `isScrolling` is true.
+- Decreased stiffness to `9.0` and adjusted damping to `6.3` inside the WASM stepper to secure critically over-damped, buttery-smooth decays.
+- Created `uTime` uniform and updated it via `state.clock.getElapsedTime()` to drive animating grain patterns.
+- Programmed Sobel normal-reconstruction on the fluid trail inside fragmentShader: `vec3 normal = normalize(vec3((dyeR - dyeL)*2.2, (dyeB - dyeT)*2.2, 0.22));`
+- Blended Blinn-Phong specular gloss `specularHighlight` and randomized grain offsets `blurOffset` inside WebGL render compositor to produce a stunning, organic, blurry texture.
+
 ## 2026-06-10: Critically Damped Spring Physics Optimization
 - **Issue**: The stopping movement of the video scrubber felt too bouncy with high oscillations because the Newton spring parameters were set to high stiffness (120) and low relative damping (25), creating rapid frame oscillations on scroll release.
 - **Solution**: Tuned the WASM physics integration to use an over-damped spring model parameter set (stiffness = 36, damping = 14.5).
