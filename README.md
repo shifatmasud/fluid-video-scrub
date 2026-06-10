@@ -81,6 +81,21 @@ We build apps like LEGO. Each piece has a specific size and place!
 
 ## Recent Updates
 
+- **Decoupled Scroll-Stopping Spring Physics (2026-06-10)**:
+  - **Summary**: Decoupled the Newtonian physics spring animation from active user drag/scroll gestures. Previously, compounding Hooke's spring math with Lenis's built-in smooth scroll easing introduced a heavy double-smoothing lag.
+  - **What changed**: Integrated active scroll sensing via `Lenis` state. Active scrolling tracks the target scroll position exactly 1:1, offering instant tactile response. On scroll release/stop, the accelerated Newtonian physics solver activates exclusively to glide, decelerate, and settle the video frame with high-fidelity dampening. Removed JavaScript mathematical fallbacks entirely, making dampening and settle operations 100% WebAssembly powered.
+  - **How to undo**: Set `const isScrolling = false;` in `VideoScrubWebGL.tsx`'s render loop to execute the spring equations at all times.
+
+- **Native WebCodecs VideoDecoder with Zero-Dependency Binary MP4 Demuxer & Clean WASM Computations (2026-06-10)**:
+  - **Summary**: Upgraded the preloading pipeline from cross-origin mp4box.js library fetching to a self-contained Web Worker utilizing a direct, zero-dependency binary MP4 box demuxer. Retained performance-critical Hooke's Spring simulations in WebAssembly while stripping out all native CSS keyframes, fallback JS math loops, and legacy HTML5 `<video>` main-thread seek-fallback logic.
+  - **Bug Fix**: Resolved a TypeError during `VideoDecoder.configure` inside sandboxed iframes. The custom binary MP4 demuxer was previously parsing nested attributes relative to the absolute `configBox.start` offset instead of `configBox.bodyStart`, causing invalid width/height readings and failing to locate nested configuration payload boxes. Solved by aligning relative offsets to use `bodyStart`/`bodyEnd` and slicing raw H.264 `AVCDecoderConfigurationRecord` blocks natively. Omitted `description` safely from configuration if null.
+  - **Architecture (IPO)**:
+    - *Input*: `videoUrl` stream fetched inside background worker.
+    - *Process*: Recursive box scanning of the array buffer (`moov` -> `trak` -> `stbl` -> `stsd`/`stsz`/`stco`/`stsc`/`stss`) coordinates exact binary indices + configurations to feed `EncodedVideoChunk` arrays directly into hardware-accelerated `VideoDecoder`.
+    - *Output*: Direct transferable zero-copy `ImageBitmap` frames piped to R3Fiber canvas and composited with Navier-Stokes GPGPU interactive fluid grids. No external CDNs or dynamic script eval scopes are used.
+  - **What changed**: (1) Overhauled the inline background preloader worker, replacing the dynamic evaluations of `mp4box.all.min.js` with structured container box byte-parsing code (`findBoxes`). (2) Discarded the fallback `runLegacyFallbackPipeline` main-thread video seeker to adhere to the strict no-fallback operational mandate. (3) Stripped out javascript spring-euler calculations to rely strictly on compiled React Three Fiber GPGPU and WebAssembly.
+  - **How to undo**: Revert `VideoScrubWebGL.tsx` preloader effect and RVFC frame callbacks to use external mp4box library `eval` and `<video>` tags.
+
 - **Offline Inlined Web Worker, Deferred Global Scope, & Dual-Tier ImageBitmap Transfer Fallback (2026-06-05)**:
   - **What changed**: (1) Resolved worker startup crashes in some environments by moving the `(0, eval)(mp4boxCode)` library evaluation from the worker's top-level scope directly into the `'init'` event messenger local scope to avoid parsing exceptions. (2) Engineered a dual-tier fallback for `ImageBitmap` frame posting: if transferring `ImageBitmap` transfers fails due to browser/iframe structured clone sandboxing restrictions, the worker catches the error and resends the frame as a cloned reference without the transfer list, preserving overall system stability. (3) Added error interceptors to cleanly forward and suppress unhandled exceptions, facilitating zero-downtime failover to the sub-pixel HTML5 main-thread seeker block.
   - **How to undo**: Revert `VideoScrubWebGL.tsx` Web Worker `eval` statement to top-level execution scope and remove the dry-run try-catch block wrapping the `postMessage(data, [bitmap])` call.

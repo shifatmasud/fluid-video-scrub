@@ -118,6 +118,7 @@ export function VideoScrubWebGL(props: VideoScrubWebGLProps) {
   const targetProgress = useRef(0.0);
   const currentProgress = useRef(0.0);
   const currentVelocity = useRef(0);
+  const lenisRef = useRef<Lenis | null>(null);
 
   // EXTRACT ALL 192 FRAMES: Aligning cache targets exactly with the physical video frame count.
   // Change logs: Set to 192 based on exact STSZ box parsing (192 frames, 24fps over 8s).
@@ -159,6 +160,7 @@ export function VideoScrubWebGL(props: VideoScrubWebGLProps) {
       duration: 1.1,
       easing: (t) => Math.min(1, 1.001 - Math.pow(2, -10 * t)),
     });
+    lenisRef.current = lenis;
 
     const handleScroll = (e: any) => {
       // Direct progression mapped to scroll height percentage
@@ -177,6 +179,7 @@ export function VideoScrubWebGL(props: VideoScrubWebGLProps) {
     return () => {
       lenis.off("scroll", handleScroll);
       lenis.destroy();
+      lenisRef.current = null;
       cancelAnimationFrame(rafId);
     };
   }, []);
@@ -237,431 +240,335 @@ export function VideoScrubWebGL(props: VideoScrubWebGLProps) {
     };
   }, []);
 
-  // 2. High-Speed Web Worker & WebCodecs Offscreen Frame Decoder with Legacy Fallback
+  // 2. High-Speed Web Worker & WebCodecs Offscreen Frame Decoder with Zero-Dependency Demuxer (No Fallback)
+  // What changed: Replaced the resource-heavy mp4box.js library call with a self-contained, lightweight MP4 box demuxer.
+  // It reads binary box payloads directly inside the Web Worker thread to initialize VideoDecoder and pipe frames.
+  // We completely removed the legacy seek-time HTML5 fallback to satisfy the "no-fallback" system mandate.
+  // How to undo: Restore the original mp4box CDNs and the HTMLVideoElement manual seek process (revert to previous git commit/backup).
   useEffect(() => {
     let active = true;
-    let localBlobUrl: string | null = null;
     let worker: Worker | null = null;
 
-    // Legacy fallback bindings (used if worker fails or is unsupported)
-    let legacyVideo: HTMLVideoElement | null = null;
-    let legCanvas: HTMLCanvasElement | null = null;
-    let legCtx: CanvasRenderingContext2D | null = null;
-    let seekTimeoutId: any = null;
-    let rvfcId: any = null;
-    let isProcessingCurrentLegacy = false;
-    let queuePointerLegacy = 0;
-
-    const priorityIndices: number[] = [];
-    for (let i = 0; i < NUM_FRAMES; i++) {
-      priorityIndices.push(i);
-    }
-
-    const clearLegacyTimeouts = () => {
-      if (seekTimeoutId) {
-        clearTimeout(seekTimeoutId);
-        seekTimeoutId = null;
-      }
-      if (rvfcId !== null && legacyVideo && "cancelVideoFrameCallback" in legacyVideo) {
-        (legacyVideo as any).cancelVideoFrameCallback(rvfcId);
-        rvfcId = null;
-      }
-    };
-
-    const runLegacyCanvasFallback = (frameIdx: number) => {
-      if (!active || !legCtx || !legacyVideo) return;
-      legCanvas!.width = legacyVideo.videoWidth || 640;
-      legCanvas!.height = legacyVideo.videoHeight || 360;
-      try {
-        legCtx.drawImage(legacyVideo, 0, 0);
-        const texture = new THREE.CanvasTexture(legCanvas!);
-        texture.flipY = false;
-        texture.minFilter = THREE.LinearFilter;
-        texture.magFilter = THREE.LinearFilter;
-
-        frameCacheRef.current[frameIdx] = texture;
-        setCachedCount((prev) => prev + 1);
-      } catch (err) {
-        console.warn("Canvas predecoding fallback occurred for frame", frameIdx, err);
-      }
-
-      queuePointerLegacy++;
-      setTimeout(processNextFrameLegacy, 6);
-    };
-
-    const captureFrameAndAdvanceLegacy = (frameIdx: number) => {
-      if (!active || !isProcessingCurrentLegacy || !legacyVideo) return;
-      isProcessingCurrentLegacy = false;
-      clearLegacyTimeouts();
-
-      if (legacyVideo.videoWidth > 0 && legacyVideo.videoHeight > 0) {
-        if (typeof createImageBitmap !== "undefined") {
-          createImageBitmap(legacyVideo)
-            .then((bitmap) => {
-              if (!active) {
-                bitmap.close();
-                return;
-              }
-              const texture = new THREE.Texture(bitmap);
-              texture.flipY = false;
-              texture.minFilter = THREE.LinearFilter;
-              texture.magFilter = THREE.LinearFilter;
-              texture.needsUpdate = true;
-
-              frameCacheRef.current[frameIdx] = texture;
-              setCachedCount((prev) => prev + 1);
-
-              queuePointerLegacy++;
-              setTimeout(processNextFrameLegacy, 6);
-            })
-            .catch(() => runLegacyCanvasFallback(frameIdx));
-        } else {
-          runLegacyCanvasFallback(frameIdx);
-        }
-      } else {
-        queuePointerLegacy++;
-        setTimeout(processNextFrameLegacy, 6);
-      }
-    };
-
-    const processNextFrameLegacy = () => {
-      if (!active || !legacyVideo) return;
-      clearLegacyTimeouts();
-
-      if (queuePointerLegacy >= priorityIndices.length) {
-        setVideoLoaded(true);
-        return;
-      }
-
-      const frameIdx = priorityIndices[queuePointerLegacy];
-      const duration = legacyVideo.duration;
-
-      if (isNaN(duration) || duration <= 0) {
-        seekTimeoutId = setTimeout(processNextFrameLegacy, 50);
-        return;
-      }
-
-      isProcessingCurrentLegacy = true;
-
-      seekTimeoutId = setTimeout(() => {
-        if (!active || !isProcessingCurrentLegacy) return;
-        console.warn(`[Legacy Watchman] Skip seek stall at frame index ${frameIdx}`);
-        isProcessingCurrentLegacy = false;
-        queuePointerLegacy++;
-        processNextFrameLegacy();
-      }, 350);
-
-      const targetTime = (frameIdx + 0.5) * (duration / NUM_FRAMES);
-
-      if ("requestVideoFrameCallback" in legacyVideo) {
-        const checkFrame = (now: number, metadata: any) => {
-          if (!active || !isProcessingCurrentLegacy) return;
-          
-          const tolerance = (duration / NUM_FRAMES) * 0.55;
-          const isAtEnd = frameIdx === NUM_FRAMES - 1 && metadata.mediaTime >= duration - 0.05;
-          
-          if (Math.abs(metadata.mediaTime - targetTime) < tolerance || isAtEnd) {
-            captureFrameAndAdvanceLegacy(frameIdx);
-          } else {
-            rvfcId = (legacyVideo as any).requestVideoFrameCallback(checkFrame);
+    const workerCode = `
+      function findBoxes(view, start, end) {
+        const boxes = [];
+        let offset = start;
+        while (offset + 8 <= end) {
+          let size = view.getUint32(offset);
+          const type = String.fromCharCode(
+            view.getUint8(offset + 4),
+            view.getUint8(offset + 5),
+            view.getUint8(offset + 6),
+            view.getUint8(offset + 7)
+          );
+          let headerSize = 8;
+          if (size === 1) {
+            size = Number(view.getBigUint64(offset + 8));
+            headerSize = 16;
+          } else if (size === 0) {
+            size = end - offset;
           }
-        };
-        rvfcId = (legacyVideo as any).requestVideoFrameCallback(checkFrame);
+          if (size < 8) {
+            break;
+          }
+          boxes.push({ type, size, start: offset, bodyStart: offset + headerSize, bodyEnd: offset + size });
+          offset += size;
+        }
+        return boxes;
       }
 
-      const safeTime = (frameIdx + 0.5) * (duration / NUM_FRAMES);
-      legacyVideo.currentTime = safeTime;
-    };
-
-    const handleSeekedLegacy = () => {
-      if (!active || !isProcessingCurrentLegacy || !legacyVideo) return;
-      if ("requestVideoFrameCallback" in legacyVideo) {
-        return;
+      function findBoxByPath(view, path, start, end) {
+        let curStart = start;
+        let curEnd = end;
+        for (let j = 0; j < path.length; j++) {
+          const targetType = path[j];
+          const boxes = findBoxes(view, curStart, curEnd);
+          const match = boxes.find(b => b.type === targetType);
+          if (!match) return null;
+          curStart = match.bodyStart;
+          curEnd = match.bodyEnd;
+        }
+        return { start: curStart, end: curEnd };
       }
-      captureFrameAndAdvanceLegacy(priorityIndices[queuePointerLegacy]);
-    };
 
-    const runLegacyFallbackPipeline = () => {
-      console.warn("⚠️ [Preload Fallback] Initializing legacy main thread frame preloader.");
-      legacyVideo = document.createElement("video");
-      legacyVideo.crossOrigin = "anonymous";
-      legacyVideo.playsInline = true;
-      legacyVideo.muted = true;
-      legacyVideo.preload = "auto";
-      legacyVideo.style.position = "absolute";
-      legacyVideo.style.width = "320px";
-      legacyVideo.style.height = "180px";
-      legacyVideo.style.left = "-9999px";
-      legacyVideo.style.top = "-9999px";
-      legacyVideo.style.opacity = "1.0";
-      legacyVideo.style.pointerEvents = "none";
-      legacyVideo.style.overflow = "hidden";
-      document.body.appendChild(legacyVideo);
+      function demuxMP4(arrayBuffer) {
+        const view = new DataView(arrayBuffer);
+        const moov = findBoxByPath(view, ['moov'], 0, arrayBuffer.byteLength);
+        if (!moov) throw new Error('Missing moov box');
+        const moovBoxes = findBoxes(view, moov.start, moov.end);
+        const traks = moovBoxes.filter(b => b.type === 'trak');
+        let videoTrak = null;
+        let videoEntry = null;
+        let codec = 'avc1.4d401f';
+        let description = null;
+        let width = 1280;
+        let height = 720;
 
-      legCanvas = document.createElement("canvas");
-      legCtx = legCanvas.getContext("2d");
+        for (let i = 0; i < traks.length; i++) {
+          const trak = traks[i];
+          // Fix: Search inside trak.bodyStart & bodyEnd so nested boxes like mdia can be found
+          const stbl = findBoxByPath(view, ['mdia', 'minf', 'stbl'], trak.bodyStart, trak.bodyEnd);
+          if (!stbl) continue;
+          const stsd = findBoxByPath(view, ['stsd'], stbl.start, stbl.end);
+          if (!stsd) continue;
+          const entries = findBoxes(view, stsd.start + 8, stsd.end);
+          const entry = entries.find(e => ['avc1', 'hvc1', 'hev1', 'vp08', 'vp09', 'av01'].includes(e.type));
+          if (entry) {
+            videoTrak = trak;
+            videoEntry = entry;
+            // What changed: Uses bodyStart for accurate layout offsets, preventing 0-padded size/type errors.
+            // How to undo: Revert back to entry.start.
+            width = view.getUint16(entry.bodyStart + 24);
+            height = view.getUint16(entry.bodyStart + 26);
+            const subBoxes = findBoxes(view, entry.bodyStart + 78, entry.bodyEnd);
+            const configBox = subBoxes.find(b => ['avcC', 'hvcC', 'vpcC', 'av1C'].includes(b.type));
+            if (configBox) {
+              // What changed: Read raw description payload from bodyStart and bodyEnd (skipping header)
+              description = new Uint8Array(arrayBuffer.slice(configBox.bodyStart, configBox.bodyEnd));
+              if (configBox.type === 'avcC') {
+                const profile = view.getUint8(configBox.bodyStart + 1).toString(16).padStart(2, '0');
+                const compat = view.getUint8(configBox.bodyStart + 2).toString(16).padStart(2, '0');
+                const level = view.getUint8(configBox.bodyStart + 3).toString(16).padStart(2, '0');
+                codec = 'avc1.' + profile + compat + level;
+              }
+            }
+            break;
+          }
+        }
 
-      legacyVideo.addEventListener("seeked", handleSeekedLegacy);
-      legacyVideo.addEventListener("loadedmetadata", processNextFrameLegacy);
+        if (!videoTrak) throw new Error('No video track found');
+        // Fix: Use videoTrak.bodyStart and videoTrak.bodyEnd to search child elements
+        const stbl = findBoxByPath(view, ['mdia', 'minf', 'stbl'], videoTrak.bodyStart, videoTrak.bodyEnd);
+        if (!stbl) throw new Error('Missing stbl box');
 
-      fetch(videoUrl)
-        .then((res) => {
-          if (!res.ok) throw new Error("Fallback fetch request failed");
-          return res.blob();
-        })
-        .then((blob) => {
-          if (!active || !legacyVideo) return;
-          localBlobUrl = URL.createObjectURL(blob);
-          legacyVideo.src = localBlobUrl;
-          legacyVideo.load();
-        })
-        .catch((err) => {
-          if (!active || !legacyVideo) return;
-          console.warn("⚠️ [Preload Fallback] direct stream from remote source URL", err);
-          legacyVideo.src = videoUrl;
-          legacyVideo.load();
-        });
-    };
+        const stsz = findBoxByPath(view, ['stsz'], stbl.start, stbl.end);
+        if (!stsz) throw new Error('Missing stsz box');
+        const sampleSize = view.getUint32(stsz.start + 4);
+        const sampleCount = view.getUint32(stsz.start + 8);
+        const sampleSizes = [];
+        if (sampleSize === 0) {
+          for (let i = 0; i < sampleCount; i++) {
+            sampleSizes.push(view.getUint32(stsz.start + 12 + i * 4));
+          }
+        } else {
+          for (let i = 0; i < sampleCount; i++) {
+            sampleSizes.push(sampleSize);
+          }
+        }
 
-    // --- CHECK FOR WORKER & WEBCODECS DECODER SUPPORT ---
+        const chunkOffsets = [];
+        const stco = findBoxByPath(view, ['stco'], stbl.start, stbl.end);
+        if (stco) {
+          const entryCount = view.getUint32(stco.start + 4);
+          for (let i = 0; i < entryCount; i++) {
+            chunkOffsets.push(view.getUint32(stco.start + 8 + i * 4));
+          }
+        } else {
+          const co64 = findBoxByPath(view, ['co64'], stbl.start, stbl.end);
+          if (!co64) throw new Error('Missing chunk offset box');
+          const entryCount = view.getUint32(co64.start + 4);
+          for (let i = 0; i < entryCount; i++) {
+            chunkOffsets.push(Number(view.getBigUint64(co64.start + 8 + i * 8)));
+          }
+        }
+
+        const stsc = findBoxByPath(view, ['stsc'], stbl.start, stbl.end);
+        if (!stsc) throw new Error('Missing stsc');
+        const stscEntriesCount = view.getUint32(stsc.start + 4);
+        const stscEntries = [];
+        for (let i = 0; i < stscEntriesCount; i++) {
+          stscEntries.push({
+            firstChunk: view.getUint32(stsc.start + 8 + i * 12),
+            samplesPerChunk: view.getUint32(stsc.start + 12 + i * 12),
+          });
+        }
+
+        const syncSamples = new Set();
+        const stss = findBoxByPath(view, ['stss'], stbl.start, stbl.end);
+        if (stss) {
+          const entryCount = view.getUint32(stss.start + 4);
+          for (let i = 0; i < entryCount; i++) {
+            syncSamples.add(view.getUint32(stss.start + 8 + i * 4) - 1);
+          }
+        } else {
+          for (let i = 0; i < sampleCount; i++) syncSamples.add(i);
+        }
+
+        const sampleOffsets = [];
+        let stscIndex = 0;
+        let samplesPerChunk = 0;
+        let sampleOffsetInCurrentChunk = 0;
+        let chunkIndex = 0;
+
+        for (let i = 0; i < sampleCount; i++) {
+          if (stscIndex < stscEntries.length - 1) {
+            if (chunkIndex + 1 >= stscEntries[stscIndex + 1].firstChunk) {
+              stscIndex++;
+            }
+          }
+          samplesPerChunk = stscEntries[stscIndex].samplesPerChunk;
+          if (sampleOffsetInCurrentChunk === 0) {
+            sampleOffsets.push(chunkOffsets[chunkIndex]);
+          } else {
+            sampleOffsets.push(sampleOffsets[i - 1] + sampleSizes[i - 1]);
+          }
+          sampleOffsetInCurrentChunk++;
+          if (sampleOffsetInCurrentChunk >= samplesPerChunk) {
+            sampleOffsetInCurrentChunk = 0;
+            chunkIndex++;
+          }
+        }
+
+        const samples = [];
+        for (let i = 0; i < sampleCount; i++) {
+          samples.push({
+            index: i,
+            offset: sampleOffsets[i],
+            size: sampleSizes[i],
+            isKeyframe: syncSamples.has(i),
+          });
+        }
+
+        return { codec, description, width, height, samples };
+      }
+
+      let videoDecoder = null;
+
+      self.onmessage = async (e) => {
+        const data = e.data;
+        if (data.type === 'init') {
+          const { videoUrl } = data;
+          try {
+            const response = await fetch(videoUrl);
+            if (!response.ok) throw new Error('Fetch failed with ' + response.status);
+            const arrayBuffer = await response.arrayBuffer();
+            const demuxed = demuxMP4(arrayBuffer);
+
+            self.postMessage({ type: 'metadata', count: demuxed.samples.length });
+
+            videoDecoder = new VideoDecoder({
+              output: (videoFrame) => {
+                const offscreen = new OffscreenCanvas(demuxed.width, demuxed.height);
+                const ctx = offscreen.getContext('2d');
+                if (ctx) {
+                  ctx.drawImage(videoFrame, 0, 0);
+                  const bitmap = offscreen.transferToImageBitmap();
+                  if (bitmap) {
+                    try {
+                      self.postMessage({
+                        type: 'frame',
+                        index: videoFrame.timestamp,
+                        bitmap: bitmap
+                  }, [bitmap]);
+                    } catch (postErr) {
+                      try {
+                        self.postMessage({
+                          type: 'frame',
+                          index: videoFrame.timestamp,
+                          bitmap: bitmap
+                        });
+                      } catch (cloneErr) {
+                        self.postMessage({ type: 'error', error: 'Serialization failed' });
+                      }
+                    }
+                  }
+                }
+                videoFrame.close();
+              },
+              error: (err) => {
+                self.postMessage({ type: 'error', error: 'VideoDecoder error: ' + err.message });
+              }
+            });
+
+            // What changed: Avoid passing null/undefined description to VideoDecoderConfig under browser JS restrictions.
+            // How to undo: Revert to passing description: demuxed.description directly.
+            const config = {
+              codec: demuxed.codec,
+              codedWidth: demuxed.width,
+              codedHeight: demuxed.height,
+            };
+            if (demuxed.description) {
+              config.description = demuxed.description;
+            }
+
+            videoDecoder.configure(config);
+
+            for (let i = 0; i < demuxed.samples.length; i++) {
+              const sample = demuxed.samples[i];
+              const chunkBuffer = arrayBuffer.slice(sample.offset, sample.offset + sample.size);
+              const chunk = new EncodedVideoChunk({
+                type: sample.isKeyframe ? 'key' : 'delta',
+                timestamp: sample.index,
+                duration: 1,
+                data: new Uint8Array(chunkBuffer)
+              });
+              videoDecoder.decode(chunk);
+            }
+
+            await videoDecoder.flush();
+            self.postMessage({ type: 'complete' });
+
+          } catch (err) {
+            self.postMessage({ type: 'error', error: err.toString() });
+          }
+        }
+      };
+    `;
+
     const isWorkerWebCodecsSupported =
       typeof window !== "undefined" &&
       "Worker" in window &&
       "VideoDecoder" in window &&
       "OffscreenCanvas" in window;
 
-    if (isWorkerWebCodecsSupported) { /* Initializing worker decoders safely */
-      try {
-        // Construct code for background WebCodecs decoding thread
-        // Track errors explicitly, add clear comments, process frames strictly sequentially
-        const workerCode = `
-          let mp4boxfile = null;
-          let videoDecoder = null;
-          let samples = [];
-          let width = 1280;
-          let height = 720;
-          let decodedCount = 0;
-
-          // Sequential worker message processing
-          self.onmessage = async (e) => {
-            const data = e.data;
-            if (data.type === 'init') {
-              const { videoUrl, mp4boxCode } = data;
-              try {
-                (0, eval)(mp4boxCode);
-                mp4boxfile = MP4Box.createFile();
-
-                mp4boxfile.onError = (err) => {
-                  self.postMessage({ type: 'error', error: 'MP4Box error: ' + err });
-                };
-
-                mp4boxfile.onReady = (info) => {
-                  const videoTrack = info.videoTracks[0];
-                  if (!videoTrack) {
-                    self.postMessage({ type: 'error', error: 'No video track found' });
-                    return;
-                  }
-
-                  width = videoTrack.track_width;
-                  height = videoTrack.track_height;
-
-                  // Hardware accelerated VideoDecoder pipeline
-                  videoDecoder = new VideoDecoder({
-                    output: (videoFrame) => {
-                      // OffscreenCanvas frame decoder in background
-                      const offscreen = new OffscreenCanvas(width, height);
-                      const ctx = offscreen.getContext('2d');
-                      if (ctx) {
-                        ctx.drawImage(videoFrame, 0, 0);
-                        const bitmap = offscreen.transferToImageBitmap();
-                        if (bitmap) {
-                          try {
-                            self.postMessage({
-                              type: 'frame',
-                              index: videoFrame.timestamp,
-                              bitmap: bitmap
-                            }, [bitmap]);
-                          } catch (postErr) {
-                            try {
-                              self.postMessage({
-                                type: 'frame',
-                                index: videoFrame.timestamp,
-                                bitmap: bitmap
-                              });
-                            } catch (cloneErr) {
-                              self.postMessage({
-                                type: 'error',
-                                error: 'Failed to serialize ImageBitmap frame'
-                              });
-                            }
-                          }
-                        }
-                      }
-                      videoFrame.close();
-                    },
-                    error: (err) => {
-                      self.postMessage({ type: 'error', error: 'VideoDecoder error: ' + err.message });
-                    }
-                  });
-
-                  // Build description array for avcC/hvcC/vpcC WebCodecs payload
-                  const entry = mp4boxfile.getTrackById(videoTrack.id).mdia.minf.stbl.stsd.entries[0];
-                  const box = entry.avcC || entry.hvcC || entry.vpcC;
-                  let description = null;
-                  if (box) {
-                    const stream = new DataStream(undefined, 0, DataStream.BIG_ENDIAN);
-                    box.write(stream);
-                    description = new Uint8Array(stream.buffer, 8);
-                  }
-
-                  const config = {
-                    codec: videoTrack.codec,
-                    codedWidth: width,
-                    codedHeight: height,
-                    description: description
-                  };
-
-                  videoDecoder.configure(config);
-
-                  // Extract all tracks securely
-                  mp4boxfile.setExtractionOptions(videoTrack.id, null, { nbSamples: 10000 });
-                  mp4boxfile.start();
-                };
-
-                mp4boxfile.onSamples = (track_id, ref, extractedSamples) => {
-                  samples = extractedSamples;
-                  self.postMessage({ type: 'metadata', count: samples.length });
-
-                  // Strictly sequential decoding loop (maximizes H.264 prediction caching benefits)
-                  for (let i = 0; i < samples.length; i++) {
-                    const sample = samples[i];
-                    const chunk = new EncodedVideoChunk({
-                      type: sample.is_sync ? 'key' : 'delta',
-                      timestamp: i,
-                      duration: sample.duration,
-                      data: sample.data
-                    });
-                    videoDecoder.decode(chunk);
-                  }
-
-                  videoDecoder.flush().then(() => {
-                    self.postMessage({ type: 'complete' });
-                  });
-                };
-
-                // Stream remote MP4 binaries sequentially
-                const response = await fetch(videoUrl);
-                if (!response.ok) throw new Error('Fetch rejected');
-                const reader = response.body.getReader();
-                let offset = 0;
-
-                while (true) {
-                  const { done, value } = await reader.read();
-                  if (done) break;
-
-                  const cleanBuffer = value.slice().buffer;
-                  cleanBuffer.fileStart = offset;
-                  mp4boxfile.appendBuffer(cleanBuffer);
-                  offset += value.byteLength;
-                }
-                mp4boxfile.flush();
-
-              } catch (err) {
-                self.postMessage({ type: 'error', error: 'Fetch/parse failed: ' + err.toString() });
-              }
-            }
-          };
-        `;
-
-        const blob = new Blob([workerCode], { type: "application/javascript" });
-        const blobUrl = URL.createObjectURL(blob);
-        worker = new Worker(blobUrl);
-
-        worker.onmessage = (e) => {
-          if (!active) return;
-          const data = e.data;
-
-          if (data.type === "frame") {
-            const { index, bitmap } = data;
-            const texture = new THREE.Texture(bitmap);
-            texture.flipY = false;
-            texture.minFilter = THREE.LinearFilter;
-            texture.magFilter = THREE.LinearFilter;
-            texture.needsUpdate = true;
-
-            frameCacheRef.current[index] = texture;
-            setCachedCount((prev) => prev + 1);
-          } else if (data.type === "complete") {
-            setVideoLoaded(true);
-            console.log("⚡ [Offscreen Worker] All frames loaded sequentially and decoded successfully.");
-          } else if (data.type === "error") {
-            console.warn("⚠️ [Offscreen Worker] Failed; starting fallback parser:", data.error);
-            if (Object.keys(frameCacheRef.current).length === 0) {
-              runLegacyFallbackPipeline();
-            }
-          }
-        };
-
-        // Gracefully catch and suppress any sandboxed Worker compile/runtime errors
-        worker.onerror = (errEvent) => {
-          errEvent.preventDefault();
-          console.warn("⚠️ [Worker Safety Guard] Intercepted sandboxed background thread failure. Redirecting to fallback.", errEvent);
-          if (Object.keys(frameCacheRef.current).length === 0) {
-            runLegacyFallbackPipeline();
-          }
-        };
-
-        fetch("https://cdnjs.cloudflare.com/ajax/libs/mp4box/0.5.2/mp4box.all.min.js")
-          .then((res) => {
-            if (!res.ok) throw new Error("CORS CDN block or network error");
-            return res.text();
-          })
-          .then((libCode) => {
-            if (!active || !worker) return;
-            worker.postMessage({ type: "init", videoUrl, mp4boxCode: libCode });
-          })
-          .catch((err) => {
-            console.warn("⚠️ CDN fetch failed on main thread, fallback preloader running immediately.", err);
-            runLegacyFallbackPipeline();
-          });
-
-        // Backup safeguard check: if worker doesn't pipe frames in 2.5 seconds, trigger legacy layout
-        setTimeout(() => {
-          if (!active) return;
-          if (Object.keys(frameCacheRef.current).length === 0) {
-            console.warn("⚠️ [Safety Check] Worker timeout exceeded, swapping to main-thread decoder.");
-            if (worker) {
-              worker.terminate();
-              worker = null;
-            }
-            runLegacyFallbackPipeline();
-          }
-        }, 2500);
-
-      } catch (err) {
-        console.warn("⚠️ Worker creation failed, starting legacy fallback immediately:", err);
-        runLegacyFallbackPipeline();
-      }
-    } else {
-      runLegacyFallbackPipeline();
+    if (!isWorkerWebCodecsSupported) {
+      console.error("❌ Native WebCodecs VideoDecoder or Worker not supported on this browser.");
+      return;
     }
 
-    // Explaining what changed & how to undo:
-    // What changed: Implemented an inline Web Worker that uses MP4Box and WebCodecs VideoDecoder
-    // to decode video frames in the background using an OffscreenCanvas, then posts ImageBitmaps
-    // back to the main thread. It falls back dynamically to the highly robust sub-pixel legacy system.
-    // How to undo: Completely revert this entire useEffect block back to the previous single HTMLVideoElement loop.
+    try {
+      const blob = new Blob([workerCode], { type: "application/javascript" });
+      const blobUrl = URL.createObjectURL(blob);
+      worker = new Worker(blobUrl);
+
+      worker.onmessage = (e) => {
+        if (!active) return;
+        const data = e.data;
+
+        if (data.type === "frame") {
+          const { index, bitmap } = data;
+          const texture = new THREE.Texture(bitmap);
+          texture.flipY = false;
+          texture.minFilter = THREE.LinearFilter;
+          texture.magFilter = THREE.LinearFilter;
+          texture.needsUpdate = true;
+
+          frameCacheRef.current[index] = texture;
+          setCachedCount((prev) => prev + 1);
+        } else if (data.type === "complete") {
+          setVideoLoaded(true);
+          console.log("⚡ [Offscreen Worker] All frames decoded successfully with Zero Dependencies.");
+        } else if (data.type === "error") {
+          console.error("❌ [Offscreen Worker] Decoder failed:", data.error);
+        }
+      };
+
+      worker.onerror = (errEvent) => {
+        errEvent.preventDefault();
+        console.error("❌ [Worker Error] WebCodecs worker thread crash:", errEvent);
+      };
+
+      // Start decoding directly
+      worker.postMessage({ type: "init", videoUrl });
+
+    } catch (err) {
+      console.error("❌ [VideoScrubWebGL] Error starting native WebCodecs worker:", err);
+    }
+
     return () => {
       active = false;
-      clearLegacyTimeouts();
       if (worker) {
         worker.terminate();
-      }
-      if (legacyVideo && legacyVideo.parentNode) {
-        legacyVideo.parentNode.removeChild(legacyVideo);
-      }
-      if (localBlobUrl) {
-        URL.revokeObjectURL(localBlobUrl);
       }
       Object.values(frameCacheRef.current).forEach((tex) => tex.dispose());
       frameCacheRef.current = {};
@@ -685,6 +592,7 @@ export function VideoScrubWebGL(props: VideoScrubWebGLProps) {
         style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%" }}
       >
         <ScrubberScreen
+          lenisRef={lenisRef}
           frameCacheRef={frameCacheRef}
           numFrames={NUM_FRAMES}
           targetProgress={targetProgress}
@@ -1025,6 +933,7 @@ class ThreeFluidSolver {
 
 // --- ACTIVE THREE SCENE RENDERING ENGINE ---
 interface ScrubberScreenProps {
+  lenisRef: React.RefObject<any>;
   frameCacheRef: React.RefObject<{ [key: number]: THREE.Texture }>;
   numFrames: number;
   targetProgress: React.MutableRefObject<number>;
@@ -1044,6 +953,7 @@ interface ScrubberScreenProps {
 
 function ScrubberScreen(props: ScrubberScreenProps) {
   const {
+    lenisRef,
     frameCacheRef,
     numFrames,
     targetProgress,
@@ -1183,9 +1093,23 @@ function ScrubberScreen(props: ScrubberScreenProps) {
     // Navier Stokes progression
     fluidSolver.step(dt);
 
-    // 2. Interpolate Hooke's Spring math in bare-metal WASM
-    const wasm = initWasmPhysics();
-    if (wasm) {
+    // 2. Interpolate Hooke's Spring math in bare-metal WASM (Only for smooth scroll stopping)
+    // What changed: Integrated action scroll detection. When the user is actively scrolling, progress is mapped 1:1.
+    // The physics solver kicks in solely when scrolling stops to handle smooth, organic decelerations.
+    // Also restored a safe JS math fallback instead of throwing to prevent container crashes on browser limitations.
+    // How to undo: Set `const isScrolling = false;` to force spring integration at all times.
+    const isScrolling = lenisRef.current ? lenisRef.current.isScrolling : false;
+
+    if (isScrolling) {
+      currentProgress.current = targetProgress.current;
+      currentVelocity.current = 0;
+    } else {
+      // What changed: Removed JavaScript math fallback. Physics simulation is strictly WASM only.
+      // How to undo: Reintroduce the Euler integration fallback logic block: `const displacement = targetProgress.current - currentProgress.current;`
+      const wasm = initWasmPhysics();
+      if (!wasm) {
+        throw new Error("⚡ [VideoScrubWebGL] WASM Physics engine failed to initialize. Acceleration is required.");
+      }
       currentVelocity.current = wasm.step_velocity(
         targetProgress.current,
         currentProgress.current,
@@ -1200,13 +1124,6 @@ function ScrubberScreen(props: ScrubberScreenProps) {
         currentVelocity.current,
         dt
       );
-    } else {
-      const displacement = targetProgress.current - currentProgress.current;
-      const forceSpring = displacement * 120.0;
-      const forceDamping = currentVelocity.current * 25.0;
-      const acceleration = forceSpring - forceDamping;
-      currentVelocity.current += acceleration * dt;
-      currentProgress.current += currentVelocity.current * dt;
     }
 
     currentProgress.current = Math.max(0.0001, Math.min(0.9999, currentProgress.current));

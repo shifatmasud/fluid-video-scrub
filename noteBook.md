@@ -1,5 +1,26 @@
 # Development Notebook - Jelly GPGPU Transition
 
+## 2026-06-10: Decoupled Physics during Active Touch / Scroll Scrubbing
+- **Issue**: Running the Newtonian physics spring interpolation loop continuously on every frame caused a visible lagging/delay block during fast user active scroll gestures. This is because Lenis already applies custom easing on the scroll `e.progress` updates, and compounding spring physics on top introduced double-smoothing lag.
+- **Solution**: Restructured the timeline progression logic to distinguish active scroll events.
+- **Implementation**:
+    - Created `lenisRef` to track the current `Lenis` scrolling state.
+    - If `lenisRef.current.isScrolling` is `true` (user is actively swiping, scrolling, or dragging), bypass Hooke's spring math and map `currentProgress.current = targetProgress.current` instantly for immediate physical response. 
+    - When `isScrolling` becomes `false` (scrolling stops), activate the bare-metal WASM spring Newtonian calculation exclusively to smoothly settle and decelerate to a stop.
+
+## 2026-06-10: Native WebCodecs VideoDecoder with Zero-Dependency Demuxer
+- **Issue**: Previously, demuxing the MP4 scroll scrubbing stream relied on fetching an external library `mp4box.all.min.js` from an external CDN and parsing track metadata dynamically via `eval` execution, which introduced external dependencies, network-blocking risks, and sandboxed iframe issues.
+- **Sub-Issue Fixed**: The custom MP4 box-scanning parser was reading width, height, and nested codecs profiles by treating `entry.start` (the full box start offset including 8-byte size and type headers) as the body start offset. This loaded garbage values or empty zeros (preventing nested `configBox` parsing). Also, H.264 `VideoDecoder.configure(config)` requires the raw `AVCDecoderConfigurationRecord` (excluding the 8-byte size and type headers of the `avcC` box), otherwise throwing standard TypeErrors in sandboxed contexts.
+- **Solution**: Developed a native container parser inside the Web Worker to demux the MP4 stream directly, allowing hardware-accelerated WebCodecs `VideoDecoder` to decode frames without any external dependencies. Removed all main-thread HTML5 `<video>` seek/seeked and Canvas-drawing fallback preloader code to align with the "no-fallback" system spec.
+- **Implementation**:
+    - Embedded recursive MP4 box parsing (`findBoxes`) directly inside the Worker.
+    - Fixed sub-box scanning offsets by correctly indexing through `entry.bodyStart` (adding 78 bytes for sample entry header and configuration fields to access payload), yielding accurate width, height, and sub-boxes.
+    - Sliced `description` payload bytes from `configBox.bodyStart` to `configBox.bodyEnd` to obtain the pure raw `AVCDecoderConfigurationRecord` block and avoid header-include TypeErrors inside `VideoDecoderConfig`.
+    - Added a safe guard that omits `description` key entirely from the configuration payload if null.
+    - Generated a structured sample offsets and sync keyframe lookup map inside the worker and fed `EncodedVideoChunk` arrays directly into the native browser `VideoDecoder`.
+    - Removed `legacyVideo`, `runLegacyFallbackPipeline`, and related fallback pipelines.
+    - Forced the spring physics interpolation loop to strictly throw an error if the compiled inline WASM Newtonian solver is unavailable, removing the JS mathematical fallback.
+
 ## 2026-05-16: Architecture Shift
 - **Issue**: `WiggleBone` relies on CPU-side bone updates which scale poorly with complex geometry and high instance counts.
 - **Solution**: GPGPU (General-Purpose GPU) simulation. 
