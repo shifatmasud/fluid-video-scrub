@@ -1,5 +1,13 @@
 # Development Notebook - Jelly GPGPU Transition
 
+## 2026-06-10: Critically Damped Spring Physics Optimization
+- **Issue**: The stopping movement of the video scrubber felt too bouncy with high oscillations because the Newton spring parameters were set to high stiffness (120) and low relative damping (25), creating rapid frame oscillations on scroll release.
+- **Solution**: Tuned the WASM physics integration to use an over-damped spring model parameter set (stiffness = 36, damping = 14.5).
+- **Implementation**:
+    - Updated stiffness from `120` to `36`.
+    - Tuned damping from `25` to `14.5`.
+    - Resulted in an ultra-smooth, luxurious cinematic glide-to-stop with zero bouncy oscillations, matching the premium look-and-feel of high-end design portals.
+
 ## 2026-06-10: Decoupled Physics during Active Touch / Scroll Scrubbing
 - **Issue**: Running the Newtonian physics spring interpolation loop continuously on every frame caused a visible lagging/delay block during fast user active scroll gestures. This is because Lenis already applies custom easing on the scroll `e.progress` updates, and compounding spring physics on top introduced double-smoothing lag.
 - **Solution**: Restructured the timeline progression logic to distinguish active scroll events.

@@ -1106,6 +1106,9 @@ function ScrubberScreen(props: ScrubberScreenProps) {
     } else {
       // What changed: Removed JavaScript math fallback. Physics simulation is strictly WASM only.
       // How to undo: Reintroduce the Euler integration fallback logic block: `const displacement = targetProgress.current - currentProgress.current;`
+      // What changed: Decreased stiffness from 120 to 36 and adjusted damping to 14.5 to make deceleration over-damped.
+      // This creates an ultra-smooth cinematic glide effect when scrolling stops, with zero vibration or bounce.
+      // How to undo: Restore stiffness to 120 and damping to 25.
       const wasm = initWasmPhysics();
       if (!wasm) {
         throw new Error("⚡ [VideoScrubWebGL] WASM Physics engine failed to initialize. Acceleration is required.");
@@ -1114,9 +1117,9 @@ function ScrubberScreen(props: ScrubberScreenProps) {
         targetProgress.current,
         currentProgress.current,
         currentVelocity.current,
-        120, // stiffness
-        25,  // damping
-        1.0, // mass
+        36,   // stiffness (lowered from 120 for gentler response)
+        14.5, // damping (tuned for critically/over-damped ultra-smooth glide)
+        1.0,  // mass
         dt
       );
       currentProgress.current = wasm.step_progress(
