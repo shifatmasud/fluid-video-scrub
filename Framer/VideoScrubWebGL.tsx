@@ -72,6 +72,15 @@ export const VideoScrubWebGL = forwardRef<VideoScrubWebGLHandle, VideoScrubWebGL
   const pointerMovedRef = useRef(false);
   const pointerHoveredRef = useRef(false);
 
+  // Screen-space pointer and touch move lock to prevent page scrolling relative-coords jumping
+  const lastClientX = useRef<number | null>(null);
+  const lastClientY = useRef<number | null>(null);
+  const lastTouchX = useRef<number | null>(null);
+  const lastTouchY = useRef<number | null>(null);
+
+  // Scroll active state reference to completely isolate fluid ripples & camera parallax from scroll action
+  const isScrollingRef = useRef(false);
+
   // Interaction Listener matching gestures and wheel states
   // What changed: Added active gesture, mouse down, touch action, and mouse wheel detection.
   // How to undo: Remove this useEffect and the associated pointer refs.
@@ -124,7 +133,15 @@ export const VideoScrubWebGL = forwardRef<VideoScrubWebGLHandle, VideoScrubWebGL
       scrollEl = parentScrollport;
     }
 
+    let scrollTimeout: any = null;
     const handleScroll = () => {
+      // Mark scrolling active to isolate fluid sim and camera parallax from scroll jumps
+      isScrollingRef.current = true;
+      if (scrollTimeout) clearTimeout(scrollTimeout);
+      scrollTimeout = setTimeout(() => {
+        isScrollingRef.current = false;
+      }, 150);
+
       let progress = 0;
       if (scrollEl === window) {
         const scrollY = window.scrollY;
@@ -158,6 +175,13 @@ export const VideoScrubWebGL = forwardRef<VideoScrubWebGLHandle, VideoScrubWebGL
   // Global pointer & touch coordinate tracking to fuel GPGPU fluid math
   useEffect(() => {
     const handleGlobalPointerMove = (e: PointerEvent) => {
+      // Screen-space movement lock: Ignore if pointer is mathematically stationary in screen coordinates
+      if (lastClientX.current === e.clientX && lastClientY.current === e.clientY) {
+        return;
+      }
+      lastClientX.current = e.clientX;
+      lastClientY.current = e.clientY;
+
       const rect = containerRef.current?.getBoundingClientRect();
       if (!rect) return;
 
@@ -181,6 +205,13 @@ export const VideoScrubWebGL = forwardRef<VideoScrubWebGLHandle, VideoScrubWebGL
     const handleGlobalTouchMove = (e: TouchEvent) => {
       if (e.touches.length > 0) {
         const touch = e.touches[0];
+        // Screen-space coordinate lock: Ignore if touch drag is mathematically stationary in screen coordinates
+        if (lastTouchX.current === touch.clientX && lastTouchY.current === touch.clientY) {
+          return;
+        }
+        lastTouchX.current = touch.clientX;
+        lastTouchY.current = touch.clientY;
+
         const rect = containerRef.current?.getBoundingClientRect();
         if (!rect) return;
 
@@ -308,6 +339,7 @@ export const VideoScrubWebGL = forwardRef<VideoScrubWebGLHandle, VideoScrubWebGL
           isPointerDownRef={isPointerDownRef}
           isTouchingRef={isTouchingRef}
           isWheelingRef={isWheelingRef}
+          isScrollingRef={isScrollingRef}
         />
       </Canvas>
     </div>
@@ -652,6 +684,7 @@ interface ScrubberScreenProps {
   isPointerDownRef: React.RefObject<boolean>;
   isTouchingRef: React.RefObject<boolean>;
   isWheelingRef: React.RefObject<boolean>;
+  isScrollingRef: React.RefObject<boolean>;
 }
 
 function ScrubberScreen(props: ScrubberScreenProps) {
@@ -676,10 +709,12 @@ function ScrubberScreen(props: ScrubberScreenProps) {
     isPointerDownRef,
     isTouchingRef,
     isWheelingRef,
+    isScrollingRef,
   } = props;
 
   const { gl, size } = useThree();
   const materialRef = useRef<THREE.ShaderMaterial>(null);
+  const meshRef = useRef<THREE.Mesh>(null);
   const prevReportedProgressRef = useRef<number>(-999);
   
   // 1. Hyper-Link Source Resolution: Resolves the local Blob URL from Cache Storage.
@@ -933,7 +968,7 @@ function ScrubberScreen(props: ScrubberScreenProps) {
     };
   }, [fluidSolver]);
 
-  // Composition shader combining webgl fluid forces and pinch distortion with WASM + GLSL temporal cross-fading
+  // Composition shader combining webgl fluid forces and fragment-based pincushion distortion with GLSL aspect ratios
   const material = useMemo(() => {
     return new THREE.ShaderMaterial({
       vertexShader: `
@@ -955,6 +990,7 @@ function ScrubberScreen(props: ScrubberScreenProps) {
         uniform float uScrubVelocity;
         uniform vec2 uCanvasResolution;
         uniform vec2 uTextureResolution;
+        uniform vec2 uParallax;
         uniform float uTime;
 
         // Custom pseudorandom noise helper
@@ -967,12 +1003,36 @@ function ScrubberScreen(props: ScrubberScreenProps) {
           vec2 fluidVelocity = texture2D(uFluidVelocity, vUv).xy;
           float fluidDye = texture2D(uFluidDye, vUv).r;
 
-          // What changed: Increased fluid trail refraction distortion power factor from 0.12 to 0.38
-          // How to undo: Revert coefficient back to 0.12
+          // Fluid trail refraction distortion vector
           vec2 fluidDistort = normalize(fluidVelocity + 0.0001) * fluidDye * uFluidDistortionPower * 0.38;
-          vec2 uv = clamp(vUv - fluidDistort, 0.001, 0.999);
 
-          // Cover crop aspect fit mapping
+          // 1. Fragment-based 3D perspective parallax projection (homography tilt approximation)
+          // What changed: Added dynamic depth-based tilt scaling along X/Y axes driven by pointer uParallax.
+          // How to undo: Set tiltX and tiltY to 0.0 and remove tiltedP's division and shift factors.
+          vec2 p = vUv - vec2(0.5);
+          float tiltX = uParallax.y * 0.15; // horizontal rotation axis (moves up/down)
+          float tiltY = uParallax.x * 0.15; // vertical rotation axis (moves left/right)
+          
+          float depthFactor = 1.0 + p.x * tiltY - p.y * tiltX;
+          vec2 tiltedP = p / max(0.5, depthFactor);
+          
+          // Gentle lateral 3D translation parallax (slide)
+          tiltedP -= uParallax * 0.03;
+
+          // 2. Fragment-based pincushion distortion to warp texture coordinates inward (concave effect)
+          // Normalize by the canvas aspect ratio so that pincushion curves are perfectly circular in screen space
+          vec2 pScreen = tiltedP;
+          pScreen.x *= (uCanvasResolution.x / uCanvasResolution.y);
+          float r2 = dot(pScreen, pScreen);
+
+          // Pincushion warping coordinates inward towards center. Scaled safely by uPinchPower
+          float distortFactor = 1.0 - uPinchPower * r2;
+          vec2 warpedUv = vec2(0.5) + tiltedP * distortFactor;
+
+          // Combine pincushion coordinates with the active fluid simulation displacement path
+          vec2 uv = clamp(warpedUv - fluidDistort, 0.001, 0.999);
+
+          // 3. Original video frame bitmap aspect ratio locked fitting
           float canvasAspect = uCanvasResolution.x / uCanvasResolution.y;
           float textureAspect = uTextureResolution.x / uTextureResolution.y;
 
@@ -984,14 +1044,13 @@ function ScrubberScreen(props: ScrubberScreenProps) {
             uv.x = (uv.x - 0.5) * scale + 0.5;
           }
 
+          // Safe margin clip protection: Render deep background if distorted coords exit boundary
           if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
             gl_FragColor = vec4(0.04, 0.04, 0.05, 1.0);
             return;
           }
 
-          // Center Pinch tactile distortion - REMOVED
-          // What changed: Removed the dynamic kinetic pinch pulling inward to keep the viewport clean and distortion-free.
-          // How to undo: Revert back to using finalDistortedUv with pinch scaling.
+          // Sample textures using final undistorted/perfectly-mapped coordinates
           vec2 flippedUv = vec2(uv.x, 1.0 - uv.y);
 
           // Generate dynamic grain noise (changes with time over coordinates)
@@ -1097,6 +1156,7 @@ function ScrubberScreen(props: ScrubberScreenProps) {
         uScrubVelocity: { value: 0 },
         uCanvasResolution: { value: new THREE.Vector2(size.width, size.height) },
         uTextureResolution: { value: new THREE.Vector2(1280, 720) },
+        uParallax: { value: new THREE.Vector2(0, 0) },
         uTime: { value: 0 },
       }
     });
@@ -1116,11 +1176,17 @@ function ScrubberScreen(props: ScrubberScreenProps) {
   useFrame((state, delta) => {
     const dt = Math.min(delta, 0.03);
 
+    // Dampen pointer velocity to zero during active scroll events
+    if (isScrollingRef.current) {
+      pointerDxRef.current = 0;
+      pointerDyRef.current = 0;
+    }
+
     // Zero-overload GPU precached frames ready. Dynamic sequential seekers pre-upload everything
     // directly on 'seeked' callbacks, completely bypassing scroll-time RAF budget bottlenecks.
 
-    // 1. GPGPU splat ripples based on cursors
-    if (pointerMovedRef.current) {
+    // 1. GPGPU splat ripples based on cursors - completely ignored during active page scroll actions
+    if (pointerMovedRef.current && !isScrollingRef.current) {
       const u = pointerXRef.current;
       const v = 1.0 - pointerYRef.current;
 
@@ -1134,6 +1200,31 @@ function ScrubberScreen(props: ScrubberScreenProps) {
 
     // Navier Stokes progression
     fluidSolver.step(dt);
+
+    // Parallax update (Gentle 3D camera parallax effect using coordinates from fluid solver pointer events)
+    // Smoothly slides/tilts with mouse movements when scrolling is idle; returns to rest center during scroll
+    const targetParallaxX = isScrollingRef.current ? 0.0 : (pointerXRef.current - 0.5);
+    const targetParallaxY = isScrollingRef.current ? 0.0 : (pointerYRef.current - 0.5);
+
+    // What changed: Drive the uParallax uniform values directly in the fragment shader for perfect WebGL projection.
+    // How to undo: Set these values flatly to 0.0 in the Lerp calls or remove them.
+    if (materialRef.current) {
+      materialRef.current.uniforms.uParallax.value.x = THREE.MathUtils.lerp(materialRef.current.uniforms.uParallax.value.x, targetParallaxX, 0.08);
+      materialRef.current.uniforms.uParallax.value.y = THREE.MathUtils.lerp(materialRef.current.uniforms.uParallax.value.y, targetParallaxY, 0.08);
+    } else {
+      material.uniforms.uParallax.value.x = THREE.MathUtils.lerp(material.uniforms.uParallax.value.x, targetParallaxX, 0.08);
+      material.uniforms.uParallax.value.y = THREE.MathUtils.lerp(material.uniforms.uParallax.value.y, targetParallaxY, 0.08);
+    }
+
+    if (meshRef.current) {
+      // Rotation tilt calculations
+      meshRef.current.rotation.y = THREE.MathUtils.lerp(meshRef.current.rotation.y, targetParallaxX * 0.15, 0.08);
+      meshRef.current.rotation.x = THREE.MathUtils.lerp(meshRef.current.rotation.x, -targetParallaxY * 0.15, 0.08);
+
+      // Slide coordinates parallax calculations
+      meshRef.current.position.x = THREE.MathUtils.lerp(meshRef.current.position.x, targetParallaxX * 0.12, 0.08);
+      meshRef.current.position.y = THREE.MathUtils.lerp(meshRef.current.position.y, -targetParallaxY * 0.12, 0.08);
+    }
 
     // 2. Pure 1:1 Absolute Sync Scrubber (No Glide / Easing Lag)
     // What changed: Removed the high-inertia smoothing or ease lag completely. Mapped currentProgress to targetProgress 1:1.
@@ -1233,7 +1324,7 @@ function ScrubberScreen(props: ScrubberScreenProps) {
   });
 
   return (
-    <mesh>
+    <mesh ref={meshRef} scale={[1.15, 1.15, 1]}>
       <planeGeometry args={[2, 2]} />
       <primitive object={material} ref={materialRef} attach="material" />
     </mesh>
