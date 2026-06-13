@@ -627,17 +627,24 @@ class ThreeFluidSolver {
     this.renderPass(this.gradSubMat, this.velocity.write);
     this.velocity.swap();
 
+    // Decoupled fluid simulation advection values to increase the fluid dissipation time:
+    // What changed:
+    // 1. Increased velocity dissipation from 0.98 to 0.992 to retain flow/swirl momentum longer.
+    // 2. Increased dye dissipation from 0.98 to 0.995 so the visible trails fade out much more slowly and gently.
+    // How to undo:
+    // Simply change both u_dissipation.value assignments below back to 0.98.
+    
     this.advectMat.uniforms.u_velocity_texture.value = this.velocity.read.texture;
     this.advectMat.uniforms.u_input_texture.value = this.velocity.read.texture;
     this.advectMat.uniforms.u_dt.value = dt;
-    this.advectMat.uniforms.u_dissipation.value = 0.98;
+    this.advectMat.uniforms.u_dissipation.value = 0.992; // Retains velocity momentum (previously 0.98)
     this.renderPass(this.advectMat, this.velocity.write);
     this.velocity.swap();
 
     this.advectMat.uniforms.u_velocity_texture.value = this.velocity.read.texture;
     this.advectMat.uniforms.u_input_texture.value = this.dye.read.texture;
     this.advectMat.uniforms.u_dt.value = dt * 6.0;
-    this.advectMat.uniforms.u_dissipation.value = 0.98;
+    this.advectMat.uniforms.u_dissipation.value = 0.995; // Retains dye color visibility (previously 0.98)
     this.renderPass(this.advectMat, this.dye.write);
     this.dye.swap();
   }
@@ -999,19 +1006,32 @@ function ScrubberScreen(props: ScrubberScreenProps) {
         }
 
         void main() {
-          // GPGPU Fluid displacement math
+          // Sample GPGPU Fluid displacement math directly on vUv
           vec2 fluidVelocity = texture2D(uFluidVelocity, vUv).xy;
           float fluidDye = texture2D(uFluidDye, vUv).r;
 
-          // Fluid trail refraction distortion vector
-          vec2 fluidDistort = normalize(fluidVelocity + 0.0001) * fluidDye * uFluidDistortionPower * 0.38;
+          // 2. Derive Height Field & Gradient mapping representing surface Normal Maps
+          float stepOffset = 1.8 / uCanvasResolution.x;
+          float dyeL = texture2D(uFluidDye, vUv + vec2(-stepOffset, 0.0)).r;
+          float dyeR = texture2D(uFluidDye, vUv + vec2(stepOffset, 0.0)).r;
+          float dyeT = texture2D(uFluidDye, vUv + vec2(0.0, -stepOffset)).r;
+          float dyeB = texture2D(uFluidDye, vUv + vec2(0.0, stepOffset)).r;
 
-          // 1. Fragment-based 3D perspective parallax projection (homography tilt approximation)
-          // What changed: Added dynamic depth-based tilt scaling along X/Y axes driven by pointer uParallax.
-          // How to undo: Set tiltX and tiltY to 0.0 and remove tiltedP's division and shift factors.
+          // Height field gradient (∇height)
+          vec2 heightGradient = vec2(dyeR - dyeL, dyeB - dyeT);
+          float slopeMagnitude = length(heightGradient); // |∇height| (slope magnitude)
+
+          // 3. Normal Map construction for Refraction Realism (Not simple depth offsets)
+          vec3 normal = normalize(vec3(heightGradient * 2.8, 0.20));
+
+          // Fluid trail refraction distortion vector: driven by normal.xy and height gradient
+          // Scale refraction offset safely by the uniform distortion coefficient uFluidDistortionPower
+          vec2 fluidDistort = normal.xy * uFluidDistortionPower * 0.22;
+
+          // 4. Fragment-based 3D perspective parallax projection (homography tilt approximation)
           vec2 p = vUv - vec2(0.5);
-          float tiltX = uParallax.y * 0.15; // horizontal rotation axis (moves up/down)
-          float tiltY = uParallax.x * 0.15; // vertical rotation axis (moves left/right)
+          float tiltX = uParallax.y * 0.15; // horizontal rotation axis
+          float tiltY = uParallax.x * 0.15; // vertical rotation axis
           
           float depthFactor = 1.0 + p.x * tiltY - p.y * tiltX;
           vec2 tiltedP = p / max(0.5, depthFactor);
@@ -1019,8 +1039,7 @@ function ScrubberScreen(props: ScrubberScreenProps) {
           // Gentle lateral 3D translation parallax (slide)
           tiltedP -= uParallax * 0.03;
 
-          // 2. Fragment-based pincushion distortion to warp texture coordinates inward (concave effect)
-          // Normalize by the canvas aspect ratio so that pincushion curves are perfectly circular in screen space
+          // 5. Fragment-based pincushion distortion to warp texture coordinates inward (concave effect)
           vec2 pScreen = tiltedP;
           pScreen.x *= (uCanvasResolution.x / uCanvasResolution.y);
           float r2 = dot(pScreen, pScreen);
@@ -1029,10 +1048,10 @@ function ScrubberScreen(props: ScrubberScreenProps) {
           float distortFactor = 1.0 - uPinchPower * r2;
           vec2 warpedUv = vec2(0.5) + tiltedP * distortFactor;
 
-          // Combine pincushion coordinates with the active fluid simulation displacement path
+          // Combine pincushion coordinates with the active fluid simulation normal-mapped refraction path
           vec2 uv = clamp(warpedUv - fluidDistort, 0.001, 0.999);
 
-          // 3. Original video frame bitmap aspect ratio locked fitting
+          // 6. Original video frame bitmap aspect ratio locked fitting
           float canvasAspect = uCanvasResolution.x / uCanvasResolution.y;
           float textureAspect = uTextureResolution.x / uTextureResolution.y;
 
@@ -1056,10 +1075,7 @@ function ScrubberScreen(props: ScrubberScreenProps) {
           // Generate dynamic grain noise (changes with time over coordinates)
           float grainNoise = rand(flippedUv * (sin(uTime) * 10.0 + 15.0)) - 0.5;
 
-          // What changed: Implemented aggressive branch pruning and key-frame sniffing to optimize texture sampling rate.
-          // By skipping secondary image fetches when blend weight is near snap bounds and bypassing multi-sample blurs when fluid dye is nominal,
-          // the GPU texture pipeline reduces active lookups from 6 per fragment to just 1 or 2, fully resolving post-preload CPU/GPU stutter.
-          // How to undo: Restore the original flat, unconditional 6-sample texture fetch block (see notebook history logs).
+          // Snapping bounds checks to optimize texture sampling rate
           vec3 colMain;
           if (uBlendWeight < 0.005) {
             colMain = texture2D(uTextureLow, flippedUv).rgb;
@@ -1097,50 +1113,89 @@ function ScrubberScreen(props: ScrubberScreenProps) {
             }
 
             vec3 colBlur = (colBlur1 + colBlur2) * 0.5;
-            float luminance = dot(colBlur, vec3(0.299, 0.587, 0.114));
             
-            // Construct semi-transparent frosted glassy tint mixed with rich grain
-            vec3 frostedTint = vec3(luminance * 1.05 + 0.08) + vec3(grainNoise) * 0.16;
-            
-            // Smoothly blend the frosted tint overlay inside active fluid dye domains
-            col = mix(colMain, frostedTint, clamp(fluidDye * 2.8, 0.0, 0.88));
+            // Water trail light absorption: volume-based shadow depth instead of foggy smoke
+            // Water absorbs red light more quickly, producing an ultra-transparent water-lens refraction effect.
+            vec3 waterAbsorption = vec3(1.0) - vec3(0.14, 0.06, 0.02) * clamp(fluidDye * 2.4, 0.0, 0.45);
+            col = colBlur * waterAbsorption;
           }
 
           // Apply gorgeous soft grain overlay overall, with custom styling
           col += vec3(grainNoise) * 0.025;
-
-          // Estimate normal gradients of the fluid trail density for diffused white specular
-          float stepOffset = 1.8 / uCanvasResolution.x;
-          float dyeL = texture2D(uFluidDye, vUv + vec2(-stepOffset, 0.0)).r;
-          float dyeR = texture2D(uFluidDye, vUv + vec2(stepOffset, 0.0)).r;
-          float dyeT = texture2D(uFluidDye, vUv + vec2(0.0, -stepOffset)).r;
-          float dyeB = texture2D(uFluidDye, vUv + vec2(0.0, stepOffset)).r;
-
-          // Sobel / central differences slope to construct virtual normals
-          vec3 normal = normalize(vec3((dyeR - dyeL) * 2.2, (dyeB - dyeT) * 2.2, 0.22));
 
           // Virtual directional light source to reflect specular glare
           vec3 lightDir = normalize(vec3(-0.35, 0.35, 0.6));
           vec3 viewDir = vec3(0.0, 0.0, 1.0);
           vec3 halfDir = normalize(lightDir + viewDir);
 
-          // Specular highlights: Blinn-Phong specular on the fluid's normal surface gradient
-          float ndh = max(0.0, dot(normal, halfDir));
-          float specIntensity = pow(ndh, 12.0) * fluidDye * 1.8;
+          // Only the disturbed areas waves crest: scale highlight specular by fluid activity
+          float fluidVelocityMag = length(fluidVelocity);
+          float disturbance = clamp(fluidDye * 3.5 + fluidVelocityMag * 0.3, 0.0, 1.0);
 
-          // Edge highlight where normal is steep (facing away from viewing direction)
-          float edgeSpec = clamp((1.0 - normal.z) * 1.5, 0.0, 1.0) * fluidDye * 0.9;
+          // Wave edge should have diffused gentle dispersion too. Very specular (Added 2026-06-13).
+          // What changed: Implemented three-channel (RGB) normal maps, split Blinn-Phong highlights,
+          // and added a soft diffused chromatic dispersion edge glow based on slope magnitude.
+          // How to undo: Restore one-channel Blinn-Phong specular with flat vec3(1.0) and delete waveEdgeDispersion.
+          vec2 gradDir = normalize(heightGradient + vec2(1e-5));
 
-          // Consolidating white specular light, adding slight grain to the glare
-          float finalSpecular = (specIntensity * 1.1 + edgeSpec * 0.9) * (0.85 + 0.15 * rand(vUv * uTime));
-          vec3 specularHighlight = vec3(1.0, 1.0, 1.0) * finalSpecular;
+          // Set up chromatic shifts depending on slope and velocity.
+          // Tightened dispersion factor for realistic high-end glass refraction, preventing massive pink/magenta color separations.
+          float dispFactor = 0.012 * (1.0 + fluidVelocityMag * 0.08);
+          vec3 normalR = normalize(vec3(heightGradient * 2.8 + gradDir * dispFactor, 0.20));
+          vec3 normalG = normalize(vec3(heightGradient * 2.8, 0.20));
+          vec3 normalB = normalize(vec3(heightGradient * 2.8 - gradDir * dispFactor, 0.20));
 
-          // Blend dyed neon trail path
-          vec3 neonGlow = vec3(0.0, 0.72, 1.0) * fluidDye * 0.35;
-          col += neonGlow;
+          // Compute Blinn-Phong specular intensity for each channel individually (highly specular)
+          float ndhR = max(0.0, dot(normalR, halfDir));
+          float ndhG = max(0.0, dot(normalG, halfDir));
+          float ndhB = max(0.0, dot(normalB, halfDir));
 
-          // Superimpose the white specular gloss map
+          float specR = pow(ndhR, 42.0) * disturbance * 3.8;
+          float specG = pow(ndhG, 42.0) * disturbance * 3.8;
+          float specB = pow(ndhB, 42.0) * disturbance * 3.8;
+
+          // Edge/slope emphasis (|∇height| / slopeMagnitude) shifted per channel for spectacular colorful wave edges
+          float edgeR = smoothstep(0.012, 0.22, length(heightGradient + gradDir * (dispFactor * 0.1))) * 2.0;
+          float edgeG = smoothstep(0.012, 0.22, slopeMagnitude) * 2.0;
+          float edgeB = smoothstep(0.012, 0.22, length(heightGradient - gradDir * (dispFactor * 0.1))) * 2.0;
+
+          float waveCrestR = specR * edgeR;
+          float waveCrestG = specG * edgeG;
+          float waveCrestB = specB * edgeB;
+
+          // Sharp steep parts (crest lines)
+          float steepR = smoothstep(0.04, 0.25, length(heightGradient + gradDir * (dispFactor * 0.15))) * disturbance * 1.6;
+          float steepG = smoothstep(0.04, 0.25, slopeMagnitude) * disturbance * 1.6;
+          float steepB = smoothstep(0.04, 0.25, length(heightGradient - gradDir * (dispFactor * 0.15))) * disturbance * 1.6;
+
+          // Specular highlights with beautiful, organic-feeling sparkling grain and chromatic dispersion splits
+          float noiseMultiplier = 0.8 + 0.2 * rand(vUv * uTime);
+          vec3 specularHighlight = vec3(
+            (waveCrestR + steepR) * noiseMultiplier,
+            (waveCrestG + steepG) * noiseMultiplier,
+            (waveCrestB + steepB) * noiseMultiplier
+          );
+
+          // Build a diffused gentle dispersion glow component for the wave edge
+          // Re-balanced RGB coefficients to form a natural, premium chromatic white light split instead of solid saturated pink.
+          vec3 waveEdgeDispersion = vec3(0.0);
+          if (slopeMagnitude > 0.002) {
+            float softR = smoothstep(0.01, 0.32, length(heightGradient + gradDir * 0.018)) * disturbance;
+            float softG = smoothstep(0.01, 0.32, slopeMagnitude) * disturbance;
+            float softB = smoothstep(0.01, 0.32, length(heightGradient - gradDir * 0.018)) * disturbance;
+            // Naturally balanced glass-prism dispersion profile (smooth off-white blending merging to pristine amber/cyan fringes)
+            waveEdgeDispersion = vec3(softR * 0.25, softG * 0.28, softB * 0.33) * uFluidDistortionPower * 1.5;
+          }
+
+          // Subtle deep water cyan-teal sheen layer (subtle ocean-like refraction light tint, replacing thick opaque neon blue)
+          vec3 waterSheen = vec3(0.02, 0.14, 0.20) * fluidDye * 0.28;
+          col += waterSheen;
+
+          // Superimpose the white specular gloss map with chromatic splits
           col += specularHighlight;
+
+          // Superimpose the diffused wave edge chromatic dispersion glow
+          col += waveEdgeDispersion;
 
           gl_FragColor = vec4(col, 1.0);
         }
@@ -1176,17 +1231,20 @@ function ScrubberScreen(props: ScrubberScreenProps) {
   useFrame((state, delta) => {
     const dt = Math.min(delta, 0.03);
 
-    // Dampen pointer velocity to zero during active scroll events
-    if (isScrollingRef.current) {
-      pointerDxRef.current = 0;
-      pointerDyRef.current = 0;
-    }
+    // Decoupled scroll and other events to ensure fluid ripples work even on scroll.
+    // What changed:
+    // 1. Removed the isScrollingRef.current pointer velocity dampening that reset deltas to zero on scroll.
+    // 2. Removed the !isScrollingRef.current constraint from the GPGPU fluid splat trigger.
+    // 3. Removed the isScrollingRef.current check from parallax calculations to maintain real-time responsiveness.
+    // How to undo:
+    // To restore the blocking/damping behavior during scroll, uncomment the block resetting pointerDxRef/pointerDyRef to 0,
+    // and re-introduce the `!isScrollingRef.current` condition in BOTH the `pointerMovedRef.current` splat block and the targetParallax calculations.
 
     // Zero-overload GPU precached frames ready. Dynamic sequential seekers pre-upload everything
     // directly on 'seeked' callbacks, completely bypassing scroll-time RAF budget bottlenecks.
 
-    // 1. GPGPU splat ripples based on cursors - completely ignored during active page scroll actions
-    if (pointerMovedRef.current && !isScrollingRef.current) {
+    // 1. GPGPU splat ripples based on cursors - decoupled to work even during active page scroll actions
+    if (pointerMovedRef.current) {
       const u = pointerXRef.current;
       const v = 1.0 - pointerYRef.current;
 
@@ -1202,9 +1260,9 @@ function ScrubberScreen(props: ScrubberScreenProps) {
     fluidSolver.step(dt);
 
     // Parallax update (Gentle 3D camera parallax effect using coordinates from fluid solver pointer events)
-    // Smoothly slides/tilts with mouse movements when scrolling is idle; returns to rest center during scroll
-    const targetParallaxX = isScrollingRef.current ? 0.0 : (pointerXRef.current - 0.5);
-    const targetParallaxY = isScrollingRef.current ? 0.0 : (pointerYRef.current - 0.5);
+    // Smoothly slides/tilts with mouse/touch movements, completely decoupled from scroll status.
+    const targetParallaxX = pointerXRef.current - 0.5;
+    const targetParallaxY = pointerYRef.current - 0.5;
 
     // What changed: Drive the uParallax uniform values directly in the fragment shader for perfect WebGL projection.
     // How to undo: Set these values flatly to 0.0 in the Lerp calls or remove them.
